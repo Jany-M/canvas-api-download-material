@@ -1,0 +1,2 @@
+[console_scripts]
+canvas-material = canvas_material_downloader.cli:main
