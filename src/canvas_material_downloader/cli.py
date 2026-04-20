@@ -33,17 +33,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include concluded courses in the course listing.",
     )
 
-    sync_course = subparsers.add_parser("sync-course", help="Download metadata and files for one course.")
+    sync_course = subparsers.add_parser("sync-course", help="Download metadata, assignments, and files for one course.")
     sync_course.add_argument("course_id", type=int, help="Canvas course ID.")
+    sync_course.add_argument("--skip-assignments", action="store_true", help="Do not fetch course assignments.")
     sync_course.add_argument("--skip-files", action="store_true", help="Do not download course files.")
     sync_course.add_argument("--skip-modules", action="store_true", help="Do not fetch module metadata.")
 
-    sync_all = subparsers.add_parser("sync-all", help="Download metadata and files for all visible courses.")
+    sync_all = subparsers.add_parser("sync-all", help="Download metadata, assignments, and files for all visible courses.")
     sync_all.add_argument(
         "--include-concluded",
         action="store_true",
         help="Include concluded courses in the sync.",
     )
+    sync_all.add_argument("--skip-assignments", action="store_true", help="Do not fetch course assignments.")
     sync_all.add_argument("--skip-files", action="store_true", help="Do not download course files.")
     sync_all.add_argument("--skip-modules", action="store_true", help="Do not fetch module metadata.")
 
@@ -64,6 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "sync-course":
             summary = downloader.sync_course(
                 args.course_id,
+                include_assignments=not args.skip_assignments,
                 include_files=not args.skip_files,
                 include_modules=not args.skip_modules,
             )
@@ -73,6 +76,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "sync-all":
             summaries = downloader.sync_all_courses(
                 include_concluded=args.include_concluded,
+                include_assignments=not args.skip_assignments,
                 include_files=not args.skip_files,
                 include_modules=not args.skip_modules,
             )
@@ -105,6 +109,8 @@ def _run_list_courses(downloader: CanvasMaterialDownloader, *, include_concluded
 def _print_sync_summary(summary: CourseSyncSummary) -> None:
     line = (
         f"[{summary.course_id}] {summary.course_name} -> "
+        f"assignments={summary.assignments_total}, "
+        f"assignment_materials={summary.assignment_materials_downloaded}, "
         f"downloaded={summary.files_downloaded}, "
         f"skipped={summary.files_skipped}, "
         f"errors={summary.file_errors}, "
@@ -118,6 +124,8 @@ def _print_sync_summary(summary: CourseSyncSummary) -> None:
 
 def _print_totals(summaries: list[CourseSyncSummary]) -> None:
     total_courses = len(summaries)
+    total_assignments = sum(summary.assignments_total for summary in summaries)
+    total_assignment_materials = sum(summary.assignment_materials_downloaded for summary in summaries)
     total_files = sum(summary.files_total for summary in summaries)
     total_downloaded = sum(summary.files_downloaded for summary in summaries)
     total_skipped = sum(summary.files_skipped for summary in summaries)
@@ -125,7 +133,8 @@ def _print_totals(summaries: list[CourseSyncSummary]) -> None:
     total_issues = sum(len(summary.issues) for summary in summaries)
 
     print(
-        f"Totals -> courses={total_courses}, files={total_files}, "
+        f"Totals -> courses={total_courses}, assignments={total_assignments}, "
+        f"assignment_materials={total_assignment_materials}, files={total_files}, "
         f"downloaded={total_downloaded}, skipped={total_skipped}, "
         f"errors={total_errors}, issues={total_issues}"
     )

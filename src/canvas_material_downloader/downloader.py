@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from html.parser import HTMLParser
+import html
 from pathlib import Path
+import re
 from typing import Any
 import json
+from urllib.parse import urljoin, urlparse
 
 from .canvas_api import CanvasApiError, CanvasClient
 from .config import Settings
-from .fs_utils import course_directory_name, file_destination_name, relative_display
+from .fs_utils import assignment_destination_name, course_directory_name, file_destination_name, relative_display
 
 
 @dataclass(slots=True)
@@ -16,12 +20,23 @@ class CourseSyncSummary:
     course_id: int
     course_name: str
     course_dir: Path
+    assignments_total: int = 0
+    assignment_materials_downloaded: int = 0
+    assignment_material_errors: int = 0
     files_total: int = 0
     files_downloaded: int = 0
     files_skipped: int = 0
     file_errors: int = 0
     modules_total: int = 0
     issues: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class AssignmentMaterialSyncResult:
+    description_html: str
+    material_files: list[dict[str, Any]] = field(default_factory=list)
+    downloaded_count: int = 0
+    error_count: int = 0
 
 
 class CanvasMaterialDownloader:
@@ -36,6 +51,7 @@ class CanvasMaterialDownloader:
         self,
         course_id: int,
         *,
+        include_assignments: bool = True,
         include_files: bool = True,
         include_modules: bool = True,
     ) -> CourseSyncSummary:
@@ -51,6 +67,7 @@ class CanvasMaterialDownloader:
 
         return self._sync_course_record(
             course,
+            include_assignments=include_assignments,
             include_files=include_files,
             include_modules=include_modules,
         )
@@ -59,6 +76,7 @@ class CanvasMaterialDownloader:
         self,
         *,
         include_concluded: bool = False,
+        include_assignments: bool = True,
         include_files: bool = True,
         include_modules: bool = True,
     ) -> list[CourseSyncSummary]:
@@ -67,6 +85,7 @@ class CanvasMaterialDownloader:
             summaries.append(
                 self._sync_course_record(
                     course,
+                    include_assignments=include_assignments,
                     include_files=include_files,
                     include_modules=include_modules,
                 )
@@ -84,6 +103,7 @@ class CanvasMaterialDownloader:
         self,
         course: dict[str, Any],
         *,
+        include_assignments: bool,
         include_files: bool,
         include_modules: bool,
     ) -> CourseSyncSummary:
@@ -128,9 +148,72 @@ class CanvasMaterialDownloader:
                     },
                 )
 
+        if include_assignments:
+            summary = self._sync_course_assignments(course_id, course_root, summary)
+
         if include_files:
             summary = self._sync_course_files(course_id, course_root, summary, modules=modules)
 
+        return summary
+
+    def _sync_course_assignments(
+        self,
+        course_id: int,
+        course_root: Path,
+        summary: CourseSyncSummary,
+    ) -> CourseSyncSummary:
+        try:
+            assignments = self.client.list_course_assignments(course_id)
+        except CanvasApiError as exc:
+            if not _is_authorization_error(exc):
+                raise
+
+            summary.issues.append(_format_issue("assignments", exc))
+            _write_json(
+                course_root / "assignments.json",
+                {
+                    "course_id": course_id,
+                    "synced_at": _utc_now_iso(),
+                    "assignments": [],
+                    "error": str(exc),
+                },
+            )
+            return summary
+
+        assignments_dir = course_root / "assignments"
+        assignments_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest_entries: list[dict[str, Any]] = []
+        for assignment in assignments:
+            material_result = self._sync_assignment_materials(assignment, assignments_dir=assignments_dir)
+            rendered_assignment = dict(assignment)
+            rendered_assignment["description"] = material_result.description_html
+            destination = assignments_dir / assignment_destination_name(assignment)
+            _write_text(
+                destination,
+                _render_assignment_html(rendered_assignment, course_name=summary.course_name),
+            )
+            manifest_entries.append(
+                self._assignment_manifest_entry(
+                    assignment,
+                    course_root=course_root,
+                    destination=destination,
+                    material_files=material_result.material_files,
+                )
+            )
+            summary.assignment_materials_downloaded += material_result.downloaded_count
+            summary.assignment_material_errors += material_result.error_count
+
+        summary.assignments_total = len(assignments)
+        _write_json(
+            course_root / "assignments.json",
+            {
+                "course_id": course_id,
+                "synced_at": _utc_now_iso(),
+                "assignments": manifest_entries,
+                "source": "course_assignments",
+            },
+        )
         return summary
 
     def _sync_course_files(
@@ -267,6 +350,101 @@ class CanvasMaterialDownloader:
             entry["error"] = error
         return entry
 
+    def _assignment_manifest_entry(
+        self,
+        assignment: dict[str, Any],
+        *,
+        course_root: Path,
+        destination: Path,
+        material_files: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        entry = dict(assignment)
+        entry["local_path"] = relative_display(destination, course_root)
+        entry["material_files"] = material_files
+        entry["synced_at"] = _utc_now_iso()
+        return entry
+
+    def _sync_assignment_materials(
+        self,
+        assignment: dict[str, Any],
+        *,
+        assignments_dir: Path,
+    ) -> AssignmentMaterialSyncResult:
+        description_html = str(assignment.get("description") or "")
+        file_references = _extract_assignment_file_references(
+            description_html,
+            canvas_base_url=self.settings.base_url,
+        )
+
+        annotatable_attachment_id = assignment.get("annotatable_attachment_id")
+        if annotatable_attachment_id is not None:
+            try:
+                file_references.setdefault(int(annotatable_attachment_id), set())
+            except (TypeError, ValueError):
+                pass
+
+        if not file_references:
+            return AssignmentMaterialSyncResult(description_html=description_html)
+
+        assignment_id = int(assignment.get("id", 0))
+        materials_dir = assignments_dir / "materials" / str(assignment_id)
+        result = AssignmentMaterialSyncResult(description_html=description_html)
+
+        for file_id, url_variants in sorted(file_references.items()):
+            try:
+                file_data = self.client.get_file(file_id)
+            except CanvasApiError as exc:
+                result.error_count += 1
+                result.material_files.append(
+                    {
+                        "id": file_id,
+                        "status": "error",
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            download_url = file_data.get("url")
+            destination = materials_dir / file_destination_name(file_data)
+            status = "skipped"
+            error: str | None = None
+
+            if not download_url:
+                status = "error"
+                error = "Canvas did not provide a download URL for this assignment material."
+                result.error_count += 1
+            elif _should_download_assignment_material(file_data, destination):
+                try:
+                    self.client.download_file(str(download_url), destination)
+                    result.downloaded_count += 1
+                    status = "downloaded"
+                except CanvasApiError as exc:
+                    status = "error"
+                    error = str(exc)
+                    result.error_count += 1
+
+            relative_material_path = relative_display(destination, assignments_dir).replace("\\", "/")
+            if status != "error":
+                result.description_html = _replace_url_variants(
+                    result.description_html,
+                    url_variants,
+                    relative_material_path,
+                )
+
+            material_entry = {
+                "id": file_id,
+                "display_name": file_data.get("display_name"),
+                "local_path": relative_material_path,
+                "size": file_data.get("size"),
+                "status": status,
+                "updated_at": file_data.get("updated_at"),
+            }
+            if error:
+                material_entry["error"] = error
+            result.material_files.append(material_entry)
+
+        return result
+
     def _list_module_linked_files(
         self,
         course_id: int,
@@ -348,10 +526,28 @@ def _should_download(
     return False
 
 
+def _should_download_assignment_material(file_data: dict[str, Any], destination: Path) -> bool:
+    if not destination.exists():
+        return True
+
+    expected_size = file_data.get("size")
+    if isinstance(expected_size, int) and expected_size >= 0:
+        return destination.stat().st_size != expected_size
+
+    return False
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_suffix(f"{path.suffix}.tmp")
     temporary_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    temporary_path.write_text(content, encoding="utf-8")
     temporary_path.replace(path)
 
 
@@ -367,3 +563,134 @@ def _format_issue(resource_name: str, error: CanvasApiError) -> str:
     if error.status_code is None:
         return f"{resource_name}: {error}"
     return f"{resource_name}: HTTP {error.status_code}"
+
+
+def _render_assignment_html(assignment: dict[str, Any], *, course_name: str) -> str:
+    title = str(assignment.get("name") or f"Assignment {assignment.get('id', '')}")
+    description_html = assignment.get("description") or "<p><em>No description provided by Canvas.</em></p>"
+    html_url = assignment.get("html_url")
+    metadata_rows = [
+        ("Course", course_name),
+        ("Assignment ID", assignment.get("id")),
+        ("Due At", assignment.get("due_at")),
+        ("Unlock At", assignment.get("unlock_at")),
+        ("Lock At", assignment.get("lock_at")),
+        ("Points Possible", assignment.get("points_possible")),
+        ("Submission Types", ", ".join(assignment.get("submission_types", [])) if assignment.get("submission_types") else None),
+    ]
+    rendered_rows = "\n".join(
+        f"<li><strong>{html.escape(label)}:</strong> {html.escape(str(value))}</li>"
+        for label, value in metadata_rows
+        if value not in (None, "", [])
+    )
+    canvas_link = (
+        f'<p><a href="{html.escape(str(html_url), quote=True)}" target="_blank" rel="noreferrer">Open in Canvas</a></p>'
+        if html_url
+        else ""
+    )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>
+    body {{
+      font-family: Arial, sans-serif;
+      line-height: 1.6;
+      margin: 0;
+      background: #f6f7fb;
+      color: #1f2937;
+    }}
+    main {{
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }}
+    .card {{
+      background: #ffffff;
+      border: 1px solid #d1d5db;
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+    }}
+    h1, h2 {{
+      line-height: 1.2;
+    }}
+    ul {{
+      padding-left: 20px;
+    }}
+    a {{
+      color: #1d4ed8;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="card">
+      <h1>{html.escape(title)}</h1>
+      <ul>
+        {rendered_rows}
+      </ul>
+      {canvas_link}
+      <h2>Description</h2>
+      {description_html}
+    </div>
+  </main>
+</body>
+</html>
+"""
+
+
+CANVAS_FILE_PATH_RE = re.compile(r"/(?:api/v1/)?(?:courses/\d+/)?files/(\d+)(?:[/?#]|$)")
+
+
+class _AssignmentFileReferenceParser(HTMLParser):
+    def __init__(self, *, canvas_base_url: str) -> None:
+        super().__init__(convert_charrefs=True)
+        self.canvas_base_url = canvas_base_url.rstrip("/") + "/"
+        self.canvas_netloc = urlparse(canvas_base_url).netloc
+        self.file_references: dict[int, set[str]] = {}
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        for attribute_name, attribute_value in attrs:
+            if not attribute_value:
+                continue
+            if attribute_name not in {"href", "src", "data-api-endpoint", "data-fullsize", "data-download-url"}:
+                continue
+            self._collect_reference(attribute_value)
+
+    def _collect_reference(self, value: str) -> None:
+        resolved_url = urljoin(self.canvas_base_url, value)
+        parsed_url = urlparse(resolved_url)
+        if parsed_url.netloc != self.canvas_netloc:
+            return
+
+        match = CANVAS_FILE_PATH_RE.search(parsed_url.path)
+        if not match:
+            return
+
+        file_id = int(match.group(1))
+        variants = self.file_references.setdefault(file_id, set())
+        variants.add(value)
+        variants.add(resolved_url)
+
+
+def _extract_assignment_file_references(
+    description_html: str,
+    *,
+    canvas_base_url: str,
+) -> dict[int, set[str]]:
+    parser = _AssignmentFileReferenceParser(canvas_base_url=canvas_base_url)
+    parser.feed(description_html)
+    parser.close()
+    return parser.file_references
+
+
+def _replace_url_variants(raw_html: str, variants: set[str], replacement: str) -> str:
+    updated_html = raw_html
+    for variant in sorted(variants, key=len, reverse=True):
+        updated_html = updated_html.replace(variant, replacement)
+        updated_html = updated_html.replace(html.escape(variant, quote=True), replacement)
+    return updated_html

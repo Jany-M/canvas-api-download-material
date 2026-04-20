@@ -70,6 +70,17 @@ class CanvasClient:
         )
         return [item for item in payload if isinstance(item, dict)]
 
+    def list_course_assignments(self, course_id: int) -> list[dict[str, Any]]:
+        payload = self._get_paginated_json(
+            f"/api/v1/courses/{course_id}/assignments",
+            params={
+                "per_page": self.settings.page_size,
+                "order_by": "position",
+                "include[]": ["all_dates"],
+            },
+        )
+        return [item for item in payload if isinstance(item, dict)]
+
     def get_file(self, file_id: int) -> dict[str, Any]:
         payload = self._get_json(f"/api/v1/files/{file_id}")
         if not isinstance(payload, dict):

@@ -17,7 +17,12 @@ class CanvasMaterialDownloaderTests(unittest.TestCase):
             downloader = CanvasMaterialDownloader(_settings(temp_dir))
             downloader.client = ForbiddenGetCourseClient()
 
-            summary = downloader.sync_course(333, include_files=False, include_modules=False)
+            summary = downloader.sync_course(
+                333,
+                include_assignments=False,
+                include_files=False,
+                include_modules=False,
+            )
 
             self.assertEqual(summary.course_id, 333)
             self.assertEqual(summary.course_name, "Term 1 - ICT Fundamentals")
@@ -27,7 +32,7 @@ class CanvasMaterialDownloaderTests(unittest.TestCase):
             downloader = CanvasMaterialDownloader(_settings(temp_dir))
             downloader.client = RestrictedResourceClient()
 
-            summary = downloader.sync_course(333)
+            summary = downloader.sync_course(333, include_assignments=False)
 
             self.assertEqual(summary.course_id, 333)
             self.assertEqual(summary.modules_total, 0)
@@ -41,7 +46,7 @@ class CanvasMaterialDownloaderTests(unittest.TestCase):
             downloader = CanvasMaterialDownloader(_settings(temp_dir))
             downloader.client = ModuleFallbackClient()
 
-            summary = downloader.sync_course(333)
+            summary = downloader.sync_course(333, include_assignments=False)
             output_root = Path(temp_dir) / "333 - COMP-1005 - Term 1 - ICT Fundamentals"
 
             self.assertEqual(summary.files_total, 2)
@@ -51,6 +56,54 @@ class CanvasMaterialDownloaderTests(unittest.TestCase):
             self.assertTrue((output_root / "files" / "13916 - Week 1 Slides.pdf").exists())
             manifest = (output_root / "files.json").read_text(encoding="utf-8")
             self.assertIn('"source": "module_file_fallback"', manifest)
+
+    def test_sync_course_exports_assignments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloader = CanvasMaterialDownloader(_settings(temp_dir))
+            downloader.client = AssignmentClient()
+
+            summary = downloader.sync_course(333, include_files=False, include_modules=False)
+            output_root = Path(temp_dir) / "333 - COMP-1005 - Term 1 - ICT Fundamentals"
+
+            self.assertEqual(summary.assignments_total, 2)
+            self.assertTrue((output_root / "assignments.json").exists())
+            self.assertTrue((output_root / "assignments" / "401 - Essay 1.html").exists())
+            self.assertTrue((output_root / "assignments" / "402 - Group Project.html").exists())
+            manifest = (output_root / "assignments.json").read_text(encoding="utf-8")
+            self.assertIn('"source": "course_assignments"', manifest)
+
+    def test_sync_course_records_assignment_issue_when_listing_is_forbidden(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloader = CanvasMaterialDownloader(_settings(temp_dir))
+            downloader.client = RestrictedAssignmentsClient()
+
+            summary = downloader.sync_course(333, include_files=False, include_modules=False)
+
+            self.assertEqual(summary.assignments_total, 0)
+            self.assertEqual(summary.issues, ["assignments: HTTP 403"])
+            self.assertTrue((Path(temp_dir) / "333 - COMP-1005 - Term 1 - ICT Fundamentals" / "assignments.json").exists())
+
+    def test_sync_course_downloads_assignment_materials_and_rewrites_html(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            downloader = CanvasMaterialDownloader(_settings(temp_dir))
+            downloader.client = AssignmentMaterialClient()
+
+            summary = downloader.sync_course(333, include_files=False, include_modules=False)
+            output_root = Path(temp_dir) / "333 - COMP-1005 - Term 1 - ICT Fundamentals"
+            html_export = output_root / "assignments" / "501 - Password Challenge.html"
+            csv_material = output_root / "assignments" / "materials" / "501" / "17766 - usernames_passwords.csv"
+            doc_material = output_root / "assignments" / "materials" / "501" / "17801 - secret_text.docx"
+
+            self.assertEqual(summary.assignment_materials_downloaded, 2)
+            self.assertEqual(summary.assignment_material_errors, 0)
+            self.assertTrue(csv_material.exists())
+            self.assertTrue(doc_material.exists())
+            html_body = html_export.read_text(encoding="utf-8")
+            self.assertIn("materials/501/17766 - usernames_passwords.csv", html_body)
+            self.assertIn("materials/501/17801 - secret_text.docx", html_body)
+            manifest = (output_root / "assignments.json").read_text(encoding="utf-8")
+            self.assertIn('"material_files"', manifest)
+            self.assertIn('"local_path": "materials/501/17766 - usernames_passwords.csv"', manifest)
 
 
 class ForbiddenGetCourseClient:
@@ -109,6 +162,87 @@ class ModuleFallbackClient:
         names = {
             13915: "ICT Fundamentals Course Introduction 2024.pdf",
             13916: "Week 1 Slides.pdf",
+        }
+        return {
+            "id": file_id,
+            "display_name": names[file_id],
+            "size": file_id,
+            "updated_at": "2026-04-20T00:00:00Z",
+            "url": f"https://canvas.example.edu/files/{file_id}/download",
+        }
+
+    def download_file(self, download_url: str, destination: Path):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(download_url, encoding="utf-8")
+
+
+class AssignmentClient:
+    def get_course(self, course_id: int):
+        return {
+            "id": course_id,
+            "course_code": "COMP-1005",
+            "name": "Term 1 - ICT Fundamentals",
+        }
+
+    def list_course_assignments(self, course_id: int):
+        return [
+            {
+                "id": 401,
+                "name": "Essay 1",
+                "description": "<p>Write a short essay.</p>",
+                "due_at": "2026-05-01T12:00:00Z",
+                "submission_types": ["online_upload"],
+                "html_url": "https://canvas.example.edu/courses/333/assignments/401",
+            },
+            {
+                "id": 402,
+                "name": "Group Project",
+                "description": "",
+                "submission_types": ["online_upload", "online_text_entry"],
+            },
+        ]
+
+
+class RestrictedAssignmentsClient:
+    def get_course(self, course_id: int):
+        return {
+            "id": course_id,
+            "course_code": "COMP-1005",
+            "name": "Term 1 - ICT Fundamentals",
+        }
+
+    def list_course_assignments(self, course_id: int):
+        raise CanvasApiError("assignments forbidden", status_code=403)
+
+
+class AssignmentMaterialClient:
+    def get_course(self, course_id: int):
+        return {
+            "id": course_id,
+            "course_code": "COMP-1005",
+            "name": "Term 1 - ICT Fundamentals",
+        }
+
+    def list_course_assignments(self, course_id: int):
+        return [
+            {
+                "id": 501,
+                "name": "Password Challenge",
+                "description": (
+                    '<p><a title="usernames_passwords.csv" '
+                    'href="https://canvas.example.edu/courses/333/files/17766?verifier=abc&amp;wrap=1" '
+                    'data-api-endpoint="https://canvas.example.edu/api/v1/courses/333/files/17766">CSV file</a></p>'
+                    '<p><a title="secret_text.docx" '
+                    'href="https://canvas.example.edu/courses/333/files/17801?verifier=def&amp;wrap=1" '
+                    'data-api-endpoint="https://canvas.example.edu/api/v1/courses/333/files/17801">Word file</a></p>'
+                ),
+            }
+        ]
+
+    def get_file(self, file_id: int):
+        names = {
+            17766: "usernames_passwords.csv",
+            17801: "secret_text.docx",
         }
         return {
             "id": file_id,

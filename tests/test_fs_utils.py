@@ -5,7 +5,12 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from canvas_material_downloader.fs_utils import course_directory_name, file_destination_name, sanitize_segment
+from canvas_material_downloader.fs_utils import (
+    assignment_destination_name,
+    course_directory_name,
+    file_destination_name,
+    sanitize_segment,
+)
 
 
 class FsUtilsTests(unittest.TestCase):
@@ -22,6 +27,10 @@ class FsUtilsTests(unittest.TestCase):
     def test_file_destination_name_prefixes_file_id(self) -> None:
         file_data = {"id": 99, "display_name": "Syllabus.pdf"}
         self.assertEqual(file_destination_name(file_data), "99 - Syllabus.pdf")
+
+    def test_assignment_destination_name_prefixes_assignment_id(self) -> None:
+        assignment = {"id": 12, "name": "Essay 1"}
+        self.assertEqual(assignment_destination_name(assignment), "12 - Essay 1.html")
 
 
 if __name__ == "__main__":

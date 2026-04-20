@@ -68,6 +68,15 @@ def file_destination_name(file_data: dict[str, Any]) -> str:
     return sanitize_segment(f"{file_id} - {display_name}", fallback=f"{file_id} - download")
 
 
+def assignment_destination_name(assignment: dict[str, Any]) -> str:
+    assignment_id = str(assignment.get("id", "assignment"))
+    assignment_name = assignment.get("name") or "assignment"
+    return sanitize_segment(
+        f"{assignment_id} - {assignment_name}.html",
+        fallback=f"{assignment_id} - assignment.html",
+    )
+
+
 def relative_display(path: Path, root: Path) -> str:
     try:
         return str(path.relative_to(root))
